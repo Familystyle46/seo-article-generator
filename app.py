@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 # ── Modules ────────────────────────────────────────────────────────────────────
 from modules.utils import fetch_sitemap, scrape_page_text, slug_from_keyword, make_gemini
 from modules.pepite_finder import parse_keyword_csv, find_best_keyword
-from modules.serp_analyzer import scrape_google_serp, build_competitor_summary
+from modules.serp_analyzer import get_competitor_data, build_competitor_summary
 from modules.insight_miner import generate_insights
 from modules.semantic_architect import build_brief, find_internal_links
 from modules.seo_calculator import calculate_word_budget
@@ -449,15 +449,22 @@ with tab_generate:
                 keyword = st.session_state.keyword_data["keyword"]
                 search_intent = st.session_state.keyword_data.get("search_intent", "informational")
 
-                # 2a — SERP
+                # 2a — SERP (Google → DuckDuckGo → Gemini IA)
                 if num_serp_results > 0:
-                    st.write(f"🔍 Scraping Google (top {num_serp_results} résultats)…")
-                    serp_results = scrape_google_serp(keyword, num_results=num_serp_results)
-                    competitor_summary = build_competitor_summary(serp_results)
-                    n_found = len(serp_results)
-                    st.write(f"   → {n_found} concurrents analysés")
-                    if n_found == 0:
-                        st.warning("Scraping Google bloqué ou sans résultat — le brief sera construit sans analyse concurrents.")
+                    st.write(f"🔍 Analyse des concurrents (top {num_serp_results})…")
+                    serp_results, serp_source = get_competitor_data(
+                        keyword, num_serp_results, gemini
+                    )
+                    if serp_source == "google":
+                        competitor_summary = build_competitor_summary(serp_results)
+                        st.write(f"   → ✅ {len(serp_results)} concurrents scrapés via **Google**")
+                    elif serp_source == "duckduckgo":
+                        competitor_summary = build_competitor_summary(serp_results)
+                        st.write(f"   → ✅ {len(serp_results)} concurrents scrapés via **DuckDuckGo**")
+                    else:
+                        # serp_source contient le résumé Gemini directement
+                        competitor_summary = serp_source
+                        st.warning("⚠️ Scraping web bloqué → **Gemini IA** a généré l'analyse concurrentielle")
                 else:
                     competitor_summary = ""
                     st.write("⏭️ Analyse SERP désactivée")

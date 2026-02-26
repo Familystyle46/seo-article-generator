@@ -151,21 +151,33 @@ def find_internal_links(
     gemini_model,
 ) -> list[dict]:
     """
-    Identify the most relevant internal links from the sitemap
-    to naturally insert in the article.
+    Identify the most relevant internal links from the sitemap.
+    Validates all returned URLs against the sitemap to prevent hallucinations.
     """
     if not sitemap_urls:
         return []
 
-    # Filter to substantive URLs only (avoid category pages with <5 path segments)
-    candidate_urls = [u for u in sitemap_urls if len(u.rstrip("/").split("/")) >= 4][:80]
+    # Build normalised lookup sets (with and without trailing slash)
+    sitemap_set_exact    = set(sitemap_urls)
+    sitemap_set_stripped = {u.rstrip("/"): u for u in sitemap_urls}
+
+    # Keep substantive pages — exclude bare homepage (≤3 path parts)
+    candidate_urls = [
+        u for u in sitemap_urls
+        if len(u.rstrip("/").split("/")) >= 4
+    ][:100]
 
     if not candidate_urls:
-        candidate_urls = sitemap_urls[:60]
+        # Site has very short URLs — use all
+        candidate_urls = sitemap_urls[:80]
 
-    # Build list of section titles for context
+    # Section titles for context
     sections_text = "\n".join(
-        f"- H2: {s.get('h2', '')}" + "".join(f"\n  - H3: {ss.get('h3', '')}" for ss in s.get("subsections", []))
+        f"- [{s.get('id', '?')}] H2: {s.get('h2', '')}"
+        + "".join(
+            f"\n  - [{ss.get('id', '?')}] H3: {ss.get('h3', '')}"
+            for ss in s.get("subsections", [])
+        )
         for s in brief.get("sections", [])
     )
 
@@ -175,48 +187,82 @@ ARTICLE EN COURS DE RÉDACTION :
 Mot-clé principal : {keyword}
 H1 : {brief.get('h1', '')}
 
-STRUCTURE DES SECTIONS :
+STRUCTURE DES SECTIONS (avec IDs) :
 {sections_text}
 
-URLS DU SITE DISPONIBLES POUR MAILLAGE INTERNE :
-{chr(10).join(candidate_urls[:70])}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LISTE COMPLÈTE DES URLs DISPONIBLES (copie exacte depuis le sitemap) :
+{chr(10).join(candidate_urls)}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-OBJECTIF : Sélectionne 3 à 5 URLs du site à lier naturellement dans l'article.
+RÈGLES ABSOLUES :
+1. Tu dois choisir UNIQUEMENT des URLs figurant EXACTEMENT dans la liste ci-dessus
+2. Copie l'URL mot pour mot, sans modification, sans invention
+3. Sélectionne 3 à 5 URLs complémentaires (pas concurrentes) à l'article
+4. L'ancre doit être naturelle, descriptive, avec des mots-clés SEO pertinents
+5. Place chaque lien dans la section la plus cohérente (utilise l'ID de section)
 
-RÈGLES :
-- Choisir des pages complémentaires qui apportent une vraie valeur ajoutée au lecteur
-- L'ancre de texte doit être naturelle, descriptive (jamais "cliquez ici" ou "en savoir plus")
-- L'ancre doit contenir des mots-clés pertinents pour le SEO
-- Préciser dans quelle section (id) placer chaque lien
-- Chaque lien doit s'intégrer dans un contexte de phrase précis
-
-Réponds UNIQUEMENT avec un objet JSON valide, aucun texte avant ni après :
+Réponds UNIQUEMENT avec un JSON valide :
 {{
   "internal_links": [
     {{
-      "url": "https://...",
-      "anchor_text": "texte d'ancre naturel et descriptif",
+      "url": "URL EXACTE copiée depuis la liste ci-dessus",
+      "anchor_text": "texte d'ancre naturel et descriptif (5-8 mots)",
       "target_section_id": "s1",
-      "integration_hint": "Phrase ou contexte exact où placer ce lien (exemple : 'Après avoir expliqué X, mentionner que pour Y, voir notre guide sur...')"
-    }},
-    {{
-      "url": "https://...",
-      "anchor_text": "autre ancre",
-      "target_section_id": "s2",
-      "integration_hint": "Contexte d'intégration"
+      "integration_hint": "Contexte précis où placer ce lien dans la section"
     }}
   ]
 }}"""
 
-    response = gemini_model.generate_content(prompt)
-    raw = response.text.strip()
+    try:
+        response = gemini_model.generate_content(prompt)
+        raw = response.text.strip()
+    except Exception as e:
+        print(f"[maillage] Erreur Gemini : {e}")
+        return []
 
     json_str = extract_json_from_text(raw)
-    if json_str:
-        try:
-            data = json.loads(json_str)
-            return data.get("internal_links", [])
-        except json.JSONDecodeError:
-            pass
+    if not json_str:
+        print(f"[maillage] Pas de JSON dans la réponse Gemini")
+        return []
 
-    return []
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        print(f"[maillage] JSON invalide : {e}")
+        return []
+
+    raw_links = data.get("internal_links", [])
+    valid_links: list[dict] = []
+
+    for link in raw_links:
+        url = link.get("url", "").strip()
+        if not url:
+            continue
+
+        # Validation 1 : URL exacte dans le sitemap
+        if url in sitemap_set_exact:
+            valid_links.append(link)
+            continue
+
+        # Validation 2 : même URL sans slash final
+        url_stripped = url.rstrip("/")
+        if url_stripped in sitemap_set_stripped:
+            link["url"] = sitemap_set_stripped[url_stripped]  # version canonique
+            valid_links.append(link)
+            continue
+
+        # Validation 3 : correspondance partielle (Gemini a peut-être tronqué)
+        matched = next(
+            (s for s in sitemap_urls if url_stripped in s or s.rstrip("/") in url_stripped),
+            None,
+        )
+        if matched:
+            link["url"] = matched
+            valid_links.append(link)
+            print(f"[maillage] URL approchée acceptée : {url} → {matched}")
+            continue
+
+        print(f"[maillage] URL hallucin\u00e9e ignorée : {url}")
+
+    return valid_links
