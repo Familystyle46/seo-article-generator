@@ -21,6 +21,13 @@ from modules.insight_miner import generate_insights
 from modules.semantic_architect import build_brief, find_internal_links
 from modules.seo_calculator import calculate_word_budget
 from modules.redacteur import write_article
+from modules.post_analyzer import (
+    score_article_seo, generate_headline_variants,
+    generate_meta_variants, find_quick_wins,
+)
+from modules.rewriter import (
+    analyze_article_for_rewrite, rewrite_article, load_article_from_url,
+)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 load_dotenv(override=True)
@@ -134,6 +141,14 @@ def _init_state() -> None:
         "insights": {},
         "history": [],
         "running": False,
+        # Post-analysis (Étape 5)
+        "article_analysis": None,
+        "headline_variants": [],
+        "meta_variants": [],
+        "quick_wins": [],
+        # Rewrite mode
+        "rewrite_result": None,
+        "rewrite_analysis": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -320,7 +335,9 @@ with st.sidebar:
 # MAIN TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab_generate, tab_history, tab_help = st.tabs(["🚀 Générer", "📂 Historique", "❓ Guide"])
+tab_generate, tab_rewrite, tab_history, tab_help = st.tabs([
+    "🚀 Générer", "🔄 Réécriture", "📂 Historique", "❓ Guide"
+])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -590,6 +607,50 @@ with tab_generate:
         if pipeline_error:
             st.error(f"Pipeline interrompu à l'étape 4 : {pipeline_error}")
         else:
+            # ── STEP 5 — Post-analysis ─────────────────────────────────────────
+            with st.status("**Étape 5 — Analyse SEO** : score, variantes titres & meta, quick wins…", expanded=True) as s5:
+                try:
+                    article_result = st.session_state.result
+                    current_brief  = st.session_state.brief or {}
+                    current_kw     = article_result.get("keyword", "")
+
+                    st.write("📊 Calcul du score SEO de l'article…")
+                    article_analysis = score_article_seo(
+                        article_result["markdown"], current_kw, current_brief, gemini
+                    )
+                    st.session_state.article_analysis = article_analysis
+
+                    st.write("🎯 Génération des variantes de titres H1…")
+                    headline_variants = generate_headline_variants(current_kw, current_brief, gemini)
+                    st.session_state.headline_variants = headline_variants
+
+                    st.write("📝 Génération des variantes de meta description…")
+                    meta_variants = generate_meta_variants(current_kw, current_brief, gemini)
+                    st.session_state.meta_variants = meta_variants
+
+                    st.write("💡 Identification des quick wins SEO…")
+                    quick_wins = find_quick_wins(
+                        st.session_state.sitemap_urls,
+                        current_kw,
+                        category_url.strip() if category_url else "",
+                        gemini,
+                    )
+                    st.session_state.quick_wins = quick_wins
+
+                    score = article_analysis.get("score_global", 0)
+                    s5.update(
+                        label=(
+                            f"✅ Étape 5 — Score SEO : **{score}/100** "
+                            f"| {len(headline_variants)} titres "
+                            f"| {len(meta_variants)} meta "
+                            f"| {len(quick_wins)} quick wins"
+                        ),
+                        state="complete",
+                    )
+                except Exception as e:
+                    s5.update(label=f"⚠️ Étape 5 — Analyse partielle : {e}", state="error")
+                    # Non-bloquant : l'article est déjà généré
+
             st.session_state.running = False
 
     # ── Results display ────────────────────────────────────────────────────────
@@ -607,7 +668,9 @@ with tab_generate:
         col4.metric("Liens internes", len(st.session_state.internal_links))
 
         # Output tabs
-        out_md, out_html, out_preview, out_brief = st.tabs(["📝 Markdown", "🌐 HTML", "👁️ Aperçu", "📋 Brief JSON"])
+        out_md, out_html, out_preview, out_brief, out_analysis = st.tabs([
+            "📝 Markdown", "🌐 HTML", "👁️ Aperçu", "📋 Brief JSON", "📊 Analyse SEO"
+        ])
 
         with out_md:
             st.code(result["markdown"], language="markdown", line_numbers=True)
@@ -642,9 +705,329 @@ with tab_generate:
                 st.markdown("**Liens internes**")
                 st.json(st.session_state.internal_links)
 
+        with out_analysis:
+            analysis = st.session_state.get("article_analysis")
+            if not analysis:
+                st.info("L'analyse SEO sera disponible après la prochaine génération.")
+            else:
+                # ── Score global ──────────────────────────────────────────────
+                score = analysis.get("score_global", 0)
+                col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns(5)
+                col_s1.metric("Score global", f"{score}/100")
+                col_s2.metric("Mots", analysis.get("word_count", "—"))
+                col_s3.metric("Densité KW", f"{analysis.get('kw_density', '—')}%")
+                col_s4.metric("H2", analysis.get("h2_count", "—"))
+                col_s5.metric("Liens int.", analysis.get("link_count", "—"))
+
+                # Score bar
+                bar_color = "#28a745" if score >= 75 else "#ffc107" if score >= 50 else "#dc3545"
+                st.markdown(
+                    f"<div style='background:#eee;border-radius:8px;height:18px;margin:8px 0'>"
+                    f"<div style='width:{score}%;background:{bar_color};height:18px;border-radius:8px;"
+                    f"transition:width 0.5s'></div></div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Scores par critère
+                scores_detail = analysis.get("scores", {})
+                if scores_detail:
+                    st.markdown("#### Détail par critère")
+                    crit_cols = st.columns(len(scores_detail))
+                    labels = {
+                        "keyword_optimization": "Mot-clé",
+                        "structure": "Structure",
+                        "content_depth": "Profondeur",
+                        "readability": "Lisibilité",
+                        "eeat": "E-E-A-T",
+                        "internal_linking": "Maillage",
+                    }
+                    for i, (k, v) in enumerate(scores_detail.items()):
+                        crit_cols[i].metric(labels.get(k, k), f"{v}/100")
+
+                # Points forts & actions
+                col_pf, col_act = st.columns(2)
+                with col_pf:
+                    st.markdown("#### ✅ Points forts")
+                    for pf in analysis.get("points_forts", []):
+                        st.markdown(f"- {pf}")
+                with col_act:
+                    st.markdown("#### 🎯 Actions prioritaires")
+                    for act in analysis.get("actions_prioritaires", []):
+                        impact_icon = "🔴" if act.get("impact") == "fort" else "🟡" if act.get("impact") == "moyen" else "🟢"
+                        st.markdown(f"{impact_icon} **{act.get('action', '')}**")
+                        st.caption(f"Impact : {act.get('impact', '—')} | Effort : {act.get('effort', '—')}")
+
+                if analysis.get("verdict"):
+                    st.info(f"**Verdict :** {analysis['verdict']}")
+
+                st.markdown("---")
+
+                # ── Variantes titres H1 ───────────────────────────────────────
+                st.markdown("#### 🎯 Variantes de titres H1")
+                headline_vars = st.session_state.get("headline_variants", [])
+                if headline_vars:
+                    for hv in headline_vars:
+                        c1, c2, c3 = st.columns([4, 1, 1])
+                        c1.markdown(f"**{hv.get('title', '')}**")
+                        c2.caption(f"CTR: {hv.get('ctr_boost', '')}")
+                        c3.caption(f"{hv.get('chars', '')} car.")
+                        if hv.get("note"):
+                            st.caption(f"   💡 {hv['note']}")
+                else:
+                    st.info("Variantes de titres non disponibles.")
+
+                st.markdown("---")
+
+                # ── Variantes meta description ────────────────────────────────
+                st.markdown("#### 📝 Variantes de meta description")
+                meta_vars = st.session_state.get("meta_variants", [])
+                if meta_vars:
+                    for mv in meta_vars:
+                        c1, c2 = st.columns([5, 1])
+                        c1.markdown(f"> {mv.get('meta', '')}")
+                        c2.caption(f"{mv.get('angle', '')} | {mv.get('chars', '')} car.")
+                else:
+                    st.info("Variantes meta non disponibles.")
+
+                st.markdown("---")
+
+                # ── Quick wins ────────────────────────────────────────────────
+                st.markdown("#### 💡 Quick Wins SEO — Prochains articles à écrire")
+                quick_wins = st.session_state.get("quick_wins", [])
+                if quick_wins:
+                    for qw in quick_wins:
+                        pot_color = "🟢" if qw.get("potential") == "fort" else "🟡" if qw.get("potential") == "moyen" else "⚪"
+                        with st.expander(f"{pot_color} **{qw.get('keyword', '')}** — {qw.get('type', '')}"):
+                            st.markdown(f"**Titre suggéré :** {qw.get('suggested_title', '')}")
+                            st.markdown(f"**Potentiel :** {qw.get('potential', '—')}")
+                            st.markdown(f"**Raison :** {qw.get('reason', '')}")
+                else:
+                    st.info("Quick wins non disponibles.")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 2 — History
+# TAB 2 — Réécriture
+# ─────────────────────────────────────────────────────────────────────────────
+
+with tab_rewrite:
+    st.markdown("## 🔄 Mode Réécriture")
+    st.markdown("Améliore et mets à jour un article existant. Colle le texte ou fournis l'URL de la page.")
+
+    rw_col1, rw_col2 = st.columns([1, 1], gap="large")
+
+    with rw_col1:
+        rw_source = st.radio(
+            "Source de l'article",
+            ["📋 Coller le texte", "🌐 URL de la page"],
+            horizontal=True,
+        )
+        if rw_source == "📋 Coller le texte":
+            rw_article_text = st.text_area(
+                "Article existant (Markdown ou texte brut)",
+                height=300,
+                placeholder="Colle ici le contenu de ton article existant…",
+            )
+            rw_url_input = ""
+        else:
+            rw_url_input = st.text_input(
+                "URL de l'article à réécrire",
+                placeholder="https://monsite.fr/mon-article/",
+            )
+            rw_article_text = ""
+
+    with rw_col2:
+        rw_keyword = st.text_input(
+            "Mot-clé cible",
+            placeholder="ex : crème solaire SPF 50",
+            help="Mot-clé principal à optimiser dans la réécriture",
+        )
+        rw_target_words = st.slider(
+            "Longueur cible (mots)",
+            min_value=800,
+            max_value=4000,
+            value=2000,
+            step=100,
+            key="rw_target_words",
+        )
+        rw_sitemap = st.text_input(
+            "URL sitemap (pour le maillage interne)",
+            placeholder="https://monsite.fr/sitemap.xml",
+            key="rw_sitemap",
+        )
+
+    rw_can_run = bool(
+        rw_keyword.strip()
+        and (rw_article_text.strip() or rw_url_input.strip())
+        and anthropic_key
+        and google_key
+    )
+    if not rw_can_run:
+        missing_rw = []
+        if not rw_keyword.strip():
+            missing_rw.append("mot-clé cible")
+        if not rw_article_text.strip() and not rw_url_input.strip():
+            missing_rw.append("article source (texte ou URL)")
+        if not anthropic_key:
+            missing_rw.append("clé Anthropic")
+        if not google_key:
+            missing_rw.append("clé Google")
+        st.info(f"⚠️ Manquant : {', '.join(missing_rw)}")
+
+    rw_btn = st.button(
+        "🔄 Analyser & Réécrire l'article",
+        type="primary",
+        disabled=not rw_can_run,
+        use_container_width=True,
+        key="rw_btn",
+    )
+
+    if rw_btn:
+        try:
+            rw_gemini = make_gemini(google_key, gemini_model_name)
+            rw_claude  = anthropic.Anthropic(api_key=anthropic_key)
+        except Exception as e:
+            st.error(f"Erreur initialisation API : {e}")
+            st.stop()
+
+        # ── Étape A : Chargement de l'article ──────────────────────────────
+        with st.status("**A — Chargement** de l'article source…", expanded=True) as rw_s1:
+            try:
+                if rw_url_input.strip():
+                    st.write(f"🌐 Scraping de : {rw_url_input.strip()}")
+                    loaded_text = load_article_from_url(rw_url_input.strip())
+                    st.write(f"   → {len(loaded_text.split())} mots récupérés")
+                else:
+                    loaded_text = rw_article_text.strip()
+                    st.write(f"   → {len(loaded_text.split())} mots depuis le presse-papier")
+                rw_s1.update(label=f"✅ A — Article chargé ({len(loaded_text.split())} mots)", state="complete")
+            except Exception as e:
+                rw_s1.update(label=f"❌ A — Erreur chargement : {e}", state="error")
+                st.stop()
+
+        # ── Étape B : Audit Gemini ─────────────────────────────────────────
+        with st.status("**B — Audit SEO** : analyse des faiblesses et axes d'amélioration…", expanded=True) as rw_s2:
+            try:
+                st.write("🤖 Gemini analyse l'article et identifie les axes d'amélioration…")
+                rw_analysis = analyze_article_for_rewrite(loaded_text, rw_keyword.strip(), rw_gemini)
+                st.session_state.rewrite_analysis = rw_analysis
+
+                score_before = rw_analysis.get("score_actuel", "?")
+                score_after  = rw_analysis.get("score_potentiel", "?")
+                rw_s2.update(
+                    label=f"✅ B — Audit terminé (score : {score_before} → {score_after}/100)",
+                    state="complete",
+                )
+
+                with st.expander("Voir l'audit SEO"):
+                    c1, c2 = st.columns(2)
+                    c1.metric("Score actuel", f"{score_before}/100")
+                    c2.metric("Score potentiel", f"{score_after}/100")
+                    if rw_analysis.get("sections_a_conserver"):
+                        st.markdown("**✅ À conserver :**")
+                        for s in rw_analysis["sections_a_conserver"]:
+                            st.markdown(f"  - {s}")
+                    if rw_analysis.get("sections_a_ameliorer"):
+                        st.markdown("**🔧 À améliorer :**")
+                        for s in rw_analysis["sections_a_ameliorer"]:
+                            st.markdown(f"  - **{s.get('section', '')}** : {s.get('solution', '')}")
+                    if rw_analysis.get("sujets_manquants"):
+                        st.markdown("**➕ Sujets à ajouter :**")
+                        for s in rw_analysis["sujets_manquants"]:
+                            st.markdown(f"  - {s}")
+                    if rw_analysis.get("keywords_manquants"):
+                        st.markdown(f"**🔍 Variantes sémantiques manquantes :** {', '.join(rw_analysis['keywords_manquants'])}")
+
+            except Exception as e:
+                rw_s2.update(label=f"❌ B — Erreur audit : {e}", state="error")
+                st.stop()
+
+        # ── Étape C : Maillage interne ─────────────────────────────────────
+        rw_internal_links: list[dict] = []
+        if rw_sitemap.strip():
+            with st.status("**C — Maillage interne** : identification des liens…", expanded=False) as rw_s3:
+                try:
+                    from modules.semantic_architect import find_internal_links as _find_links
+                    rw_sitemap_urls = fetch_sitemap(rw_sitemap.strip())
+                    rw_internal_links = _find_links(
+                        brief={"h1": rw_keyword.strip(), "sections": []},
+                        sitemap_urls=rw_sitemap_urls,
+                        keyword=rw_keyword.strip(),
+                        gemini_model=rw_gemini,
+                    )
+                    rw_s3.update(label=f"✅ C — {len(rw_internal_links)} lien(s) interne(s) identifié(s)", state="complete")
+                except Exception as e:
+                    rw_s3.update(label=f"⚠️ C — Maillage ignoré : {e}", state="error")
+
+        # ── Étape D : Réécriture Claude ────────────────────────────────────
+        with st.status("**D — Réécriture Claude** : génération de l'article amélioré…", expanded=True) as rw_s4:
+            try:
+                st.write(f"✍️ Claude (`{claude_model_name}`) réécrit l'article ({rw_target_words} mots)…")
+                st.write("   ⏳ Cette étape prend 30 à 90 secondes, patience…")
+                rw_result = rewrite_article(
+                    article_text=loaded_text,
+                    keyword=rw_keyword.strip(),
+                    analysis=st.session_state.rewrite_analysis,
+                    target_words=rw_target_words,
+                    internal_links=rw_internal_links,
+                    claude_client=rw_claude,
+                    model=claude_model_name,
+                )
+                st.session_state.rewrite_result = rw_result
+
+                # Save to disk
+                rw_slug = rw_result.get("slug", "rewrite")
+                rw_ts   = datetime.now().strftime("%Y%m%d_%H%M")
+                rw_md_path   = OUTPUT_DIR / f"{rw_ts}_rewrite_{rw_slug}.md"
+                rw_html_path = OUTPUT_DIR / f"{rw_ts}_rewrite_{rw_slug}.html"
+                rw_md_path.write_text(rw_result["markdown"], encoding="utf-8")
+                rw_html_path.write_text(rw_result["html"], encoding="utf-8")
+
+                rw_s4.update(label="✅ D — Article réécrit avec succès !", state="complete")
+            except Exception as e:
+                rw_s4.update(label=f"❌ D — Erreur réécriture : {e}", state="error")
+                st.stop()
+
+    # ── Display rewrite result ─────────────────────────────────────────────
+    if st.session_state.get("rewrite_result"):
+        rw_res = st.session_state.rewrite_result
+        rw_analysis_res = st.session_state.get("rewrite_analysis", {})
+
+        st.markdown("---")
+        st.markdown(f"## ✨ Article réécrit : <span class='kw-badge'>{rw_res.get('keyword', '')}</span>", unsafe_allow_html=True)
+
+        rw_c1, rw_c2 = st.columns(2)
+        rw_c1.metric("Score avant", f"{rw_analysis_res.get('score_actuel', '—')}/100")
+        rw_c2.metric("Score potentiel", f"{rw_analysis_res.get('score_potentiel', '—')}/100")
+
+        rw_out_md, rw_out_html, rw_out_preview = st.tabs(["📝 Markdown", "🌐 HTML", "👁️ Aperçu"])
+
+        with rw_out_md:
+            st.code(rw_res["markdown"], language="markdown", line_numbers=True)
+            st.download_button(
+                "⬇️ Télécharger .md",
+                data=rw_res["markdown"],
+                file_name=f"rewrite_{rw_res['slug']}.md",
+                mime="text/markdown",
+                key="rw_dl_md",
+            )
+
+        with rw_out_html:
+            st.code(rw_res["html"], language="html", line_numbers=True)
+            st.download_button(
+                "⬇️ Télécharger .html",
+                data=rw_res["html"],
+                file_name=f"rewrite_{rw_res['slug']}.html",
+                mime="text/html",
+                key="rw_dl_html",
+            )
+
+        with rw_out_preview:
+            st.markdown("*Aperçu rendu — ouvrir le .html pour un rendu complet*")
+            st.markdown(rw_res["markdown"], unsafe_allow_html=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 3 — History
 # ─────────────────────────────────────────────────────────────────────────────
 
 with tab_history:
